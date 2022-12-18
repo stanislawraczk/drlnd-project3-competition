@@ -5,74 +5,72 @@ import numpy as np
 import torch
 
 from ddpg import DDPGAgent
-from global_variables import BATCH_SIZE, LEARN_EVERY, TAU
+from global_variables import MU, THETA, SIGMA, SEED, BATCH_SIZE, LEARN_EVERY, LEARN_NUM, TAU
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# def soft_update(target_net, local_net, tau):
-#     for target_param, local_param in zip(target_net.parameters(), local_net.parameters()):
-#         target_param.data.copy_(local_param.data * tau + target_param.data * (1 - tau))
-
-def split_to_agents(state, num_agents):
-    states = []
-    for idx in range(num_agents):
-        states.append(state[idx::2])
-    return states
 
 class MADDPG():
-    def __init__(self, state_size, action_size, lr_actor, lr_critic, gamma, tau, buffer_size, seed):
-        self.agent = DDPGAgent(state_size, action_size, state_size, action_size, seed, lr_actor, lr_critic)
+    def __init__(self, state_size, action_size, lr_actor, lr_critic, gamma, tau, buffer_size, seed, weight_decay, epsilon, eps_decay, eps_min):
+        self.agents = [
+            DDPGAgent(state_size, action_size, lr_actor, lr_critic, gamma, tau, buffer_size, seed, weight_decay, epsilon, eps_decay, eps_min),
+            DDPGAgent(state_size, action_size, lr_actor, lr_critic, gamma, tau, buffer_size, seed, weight_decay, epsilon, eps_decay, eps_min)
+        ]
+
+        self.noise = OUNoise(action_size)
+        self.epsilon = epsilon
+        self.eps_decay = eps_decay
+        self.eps_min = eps_min
 
         self.gamma = gamma
         self.tau = tau
         self.t_step = 0
         self.memory = ReplayBuffer(buffer_size, seed)
 
-    def act(self, states, noise=0.0):
-        actions = self.agent.act(states, noise)
-        actions = actions.cpu().data.numpy()
-        return actions
-
-    def target_act(self, states, noise=0.0):
-        target_actions = self.agent.target_act(states, noise)
-        return target_actions
+    def act(self, states, add_noise=True):
+        if add_noise:
+            noise = self.epsilon * self.noise.noise()
+        actions = [agent.act(state, noise) for agent, state in zip(self.agents, states)]
+        return np.clip(actions, -1, 1)
 
     def step(self, state, action, reward, next_state, done, num_agents):
-        self.memory.add(state, action, reward, next_state, done, num_agents)
+        self.memory.add(state, action, reward, next_state, done)
         self.t_step += 1
         if len(self.memory) > BATCH_SIZE and self.t_step % LEARN_EVERY == 0:
-            experiences = self.memory.sample(BATCH_SIZE)
-            self.update(experiences)
-            self.soft_update(self.agent.target_actor, self.agent.actor, TAU)
-            self.soft_update(self.agent.target_critic, self.agent.critic, TAU)
+            for _ in range(LEARN_NUM):
+                experiences = self.memory.sample(BATCH_SIZE, num_agents)
+                for idx, agent in enumerate(self.agents):
+                    self.update(experiences,idx)
+                    agent.soft_update(agent.target_actor, agent.actor, TAU)
+                    agent.soft_update(agent.target_critic, agent.critic, TAU)
 
-    def update(self, experiences):
+    def update(self, experiences, agent_idx):
         states, actions, rewards, next_states, dones = experiences
-        self.agent.critic_optimizer.zero_grad()
-        next_actions = self.target_act(next_states)
-        with torch.no_grad():
-            Q_tagrets_next = self.agent.target_critic(next_states, next_actions)
-        Q_targets = rewards + (Q_tagrets_next * self.gamma * (1 - dones))
+        next_actions_full = [agent.target_actor(next_states[idx]) for idx, agent in enumerate(self.agents)]
+        next_actions_full = torch.cat(next_actions_full, dim=1)
+        next_states_full = torch.cat(next_states, dim=1)
+        Q_targets_next = self.agents[agent_idx].target_critic(next_states_full, next_actions_full)
+        Q_targets = rewards[agent_idx] + (Q_targets_next * self.gamma * (1 - dones[agent_idx]))
 
-        Q_expected = self.agent.critic(states, actions)
+        states_full = torch.cat(states, dim=1)
+        actions_full = torch.cat(actions, dim=1)
 
-        huber_loss = torch.nn.SmoothL1Loss()
-        critic_loss = huber_loss(Q_expected, Q_targets.detach())
+        Q_expected = self.agents[agent_idx].critic(states_full, actions_full)
+
+        critic_loss = torch.nn.functional.mse_loss(Q_expected, Q_targets)
+        self.agents[agent_idx].critic_optimizer.zero_grad()
         critic_loss.backward()
-        # torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), 0.5)
-        self.agent.critic_optimizer.step()
+        torch.nn.utils.clip_grad_norm_(self.agents[agent_idx].critic.parameters(), 1)
+        self.agents[agent_idx].critic_optimizer.step()
 
-        self.agent.actor_optimizer.zero_grad()
-
-        actions_pred = self.agent.actor(states) # [self.agent.actor(state) if i == agent_idx else self.agent.actor(state).detach() for i, state in enumerate(states)]
-
-        actor_loss = self.agent.critic(states, actions_pred).mean()
+        actions_pred = [agent.actor(states[idx]) for idx, agent in enumerate(self.agents)]
+        actions_pred = torch.cat(actions_pred, dim=1)
+        actor_loss = -self.agents[agent_idx].critic(states_full, actions_pred).mean()
+        self.agents[agent_idx].actor_optimizer.zero_grad()
         actor_loss.backward()
-        self.agent.actor_optimizer.step()
+        torch.nn.utils.clip_grad_norm_(self.agents[agent_idx].actor.parameters(), 1)
+        self.agents[agent_idx].actor_optimizer.step()
 
-    def soft_update(self, target_net, local_net, tau):
-        for target_param, local_param in zip(target_net.parameters(), local_net.parameters()):
-            target_param.data.copy_(local_param.data * tau + target_param.data * (1 - tau))
 
 class ReplayBuffer:
     def __init__(self,buffer_size, seed):
@@ -80,20 +78,57 @@ class ReplayBuffer:
         self.experience = namedtuple('Experience', field_names=['state', 'action', 'reward', 'next_state', 'done'])
         self.seed = random.seed(seed)
 
-    def add(self, state, action, reward, next_state, done, num_agents):
-        for idx in range(num_agents):
-            e = self.experience(state[idx], action[idx], reward[idx], next_state[idx], done[idx])
-            self.memory.append(e)
+    def add(self, state, action, reward, next_state, done):
+        e = self.experience(state, action, reward, next_state, done)
+        self.memory.append(e)
 
-    def sample(self, batch_size):
+    def sample(self, batch_size, num_agents):
         experiences = random.sample(self.memory, k=batch_size)
-        states = torch.from_numpy(np.vstack([e.state for e in experiences if e is not None])).float().to(device)
-        actions = torch.from_numpy(np.vstack([e.action for e in experiences if e is not None])).float().to(device)
-        rewards = torch.from_numpy(np.vstack([e.reward for e in experiences if e is not None])).float().to(device)
-        next_states = torch.from_numpy(np.vstack([e.next_state for e in experiences if e is not None])).float().to(device)
-        dones = torch.from_numpy(np.vstack([e.done for e in experiences if e is not None]).astype(np.uint8)).float().to(device)
+        
+        states = [e.state for e in experiences if e is not None]
+        actions = [e.action for e in experiences if e is not None]
+        rewards = [e.reward for e in experiences if e is not None]
+        next_states = [e.next_state for e in experiences if e is not None]
+        dones = [e.done for e in experiences if e is not None]
 
-        return (states, actions, rewards, next_states, dones)
+        states_per_agent = []
+        actions_per_agent = []
+        rewards_per_agent = []
+        next_states_per_agent = []
+        dones_per_agent = []
+
+        for idx in range(num_agents):
+            states_per_agent.append(torch.from_numpy(np.vstack([state[idx] for state in states])).float().to(device))
+            actions_per_agent.append(torch.from_numpy(np.vstack([action[idx] for action in actions])).float().to(device))
+            rewards_per_agent.append(torch.from_numpy(np.vstack([reward[idx] for reward in rewards])).float().to(device))
+            next_states_per_agent.append(torch.from_numpy(np.vstack([next_state[idx] for next_state in next_states])).float().to(device))
+            dones_per_agent.append(torch.from_numpy(np.vstack([done[idx] for done in dones]).astype(np.uint8)).float().to(device))
+
+
+        return (states_per_agent, actions_per_agent, rewards_per_agent, next_states_per_agent, dones_per_agent)
 
     def __len__(self):
         return len(self.memory)
+
+
+class OUNoise:
+
+    def __init__(self, action_dimension, mu=MU, theta=THETA, sigma=SIGMA):
+        self.action_dimension = action_dimension
+        self.mu = mu
+        self.theta = theta
+        self.sigma = sigma
+        self.state = np.ones(self.action_dimension) * self.mu
+        self.seed = random.seed(SEED)
+        np.random.seed(SEED)
+        self.reset()
+
+    def reset(self):
+        self.state = np.ones(self.action_dimension) * self.mu
+
+    def noise(self):
+        x = self.state
+        dx = self.theta * (self.mu - x) + self.sigma * np.random.standard_normal(size=len(x))
+        # dx = self.theta * (self.mu - x) + self.sigma * np.random.uniform(low=-1, high=1, size=len(x))
+        self.state = x + dx
+        return torch.tensor(self.state).float().to(device)
