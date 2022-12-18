@@ -129,6 +129,5 @@ class OUNoise:
     def noise(self):
         x = self.state
         dx = self.theta * (self.mu - x) + self.sigma * np.random.standard_normal(size=len(x))
-        # dx = self.theta * (self.mu - x) + self.sigma * np.random.uniform(low=-1, high=1, size=len(x))
         self.state = x + dx
         return torch.tensor(self.state).float().to(device)
