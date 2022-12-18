@@ -71,41 +71,52 @@ class DDPGAgent:
         action = action.cpu().data.numpy()
         return np.clip(action, -1, 1)
 
-    # def target_act(self, state):
-    #     action = self.target_actor(state)
-    #     return action
-
     def step(self, state, action, reward, next_state, done, num_agents):
-        self.memory.add(state, action, reward, next_state, done, num_agents)
+        self.memory.add(state, action, reward, next_state, done)
         self.t_step += 1
         if len(self.memory) > BATCH_SIZE and self.t_step % LEARN_EVERY == 0:
-            experiences = self.memory.sample(BATCH_SIZE)
-            self.update(experiences)
+            experiences = self.memory.sample(BATCH_SIZE, num_agents)
+            self.update(experiences, num_agents)
             self.soft_update(self.target_actor, self.actor, TAU)
             self.soft_update(self.target_critic, self.critic, TAU)
 
         self.epsilon = max(self.eps_min, self.eps_decay * self.epsilon)
 
-    def update(self, experiences):
-        states, states_full, actions, actions_full, rewards, next_states, next_states_full, dones = experiences
-        self.critic_optimizer.zero_grad()
-        next_actions = self.target_actor(next_states)
-        Q_targets_next = self.target_critic(next_states_full, next_actions)
-        Q_targets = rewards + (Q_targets_next * self.gamma * (1 - dones))
+    def update(self, experiences, num_agents):
+        states, actions, rewards, next_states, dones = experiences
+        agent_list = [idx for idx in range(2)]
+        for agent_idx in range(num_agents):
+            next_actions_full = [self.target_actor(next_states[idx]) for idx in agent_list]
+            next_actions_full = torch.cat(next_actions_full, dim=1)
+            next_states_full = [next_states[idx] for idx in agent_list]
+            next_states_full = torch.cat(next_states_full, dim=1)
+            Q_targets_next = self.target_critic(next_states_full, next_actions_full)
+            Q_targets = rewards[agent_idx] + (Q_targets_next * self.gamma * (1 - dones[agent_idx]))
 
-        Q_expected = self.critic(states_full, actions_full)
+            states_full = [states[idx] for idx in agent_list]
+            states_full = torch.cat(states_full, dim=1)
+            actions_full = [actions[idx] for idx in agent_list]
+            actions_full = torch.cat(actions_full, dim=1)
 
-        critic_loss = torch.nn.functional.mse_loss(Q_expected, Q_targets)
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), .5)
-        self.critic_optimizer.step()
+            Q_expected = self.critic(states_full, actions_full)
 
-        actions_pred = self.actor(states)
-        actor_loss = -self.critic(states, actions_pred).mean()
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), .5)
-        self.actor_optimizer.step()
+            critic_loss = torch.nn.functional.mse_loss(Q_expected, Q_targets)
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            # torch.nn.utils.clip_grad_norm_(self.critic.parameters(), .5)
+            self.critic_optimizer.step()
+
+            actions_pred = [self.actor(states[idx]) for idx in agent_list]
+            actions_pred = torch.cat(actions_pred, dim=1)
+            actor_loss = -self.critic(states_full, actions_pred).mean()
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            # torch.nn.utils.clip_grad_norm_(self.actor.parameters(), .5)
+            self.actor_optimizer.step()
+
+            #reorder the list for observation for next agent
+            agent_list = agent_list[1:]
+            agent_list.append(agent_idx)
 
     def soft_update(self, target_net, local_net, tau):
         for target_param, local_param in zip(target_net.parameters(), local_net.parameters()):
@@ -114,15 +125,14 @@ class DDPGAgent:
 class ReplayBuffer:
     def __init__(self,buffer_size, seed):
         self.memory = deque(maxlen=buffer_size)
-        self.experience = namedtuple('Experience', field_names=['state', 'state_full', 'action', 'action_full', 'reward', 'next_state', 'next_state_full', 'done'])
+        self.experience = namedtuple('Experience', field_names=['state', 'action', 'reward', 'next_state', 'done'])
         self.seed = random.seed(seed)
 
-    def add(self, state, action, reward, next_state, done, num_agents):
-        for idx in range(num_agents):
-            e = self.experience(state[idx], action[idx], reward[idx], next_state[idx], done[idx])
-            self.memory.append(e)
+    def add(self, state, action, reward, next_state, done):
+        e = self.experience(state, action, reward, next_state, done)
+        self.memory.append(e)
 
-    def sample(self, batch_size):
+    def sample(self, batch_size, num_agents):
         # przenieść układanie danych do funkcji uczącej i tam rozpakować dane na poszczególnych agentów
         experiences = random.sample(self.memory, k=batch_size)
         # states = torch.from_numpy(np.vstack([e.state for e in experiences if e is not None])).float().to(device)
@@ -140,8 +150,21 @@ class ReplayBuffer:
         next_states = [e.next_state for e in experiences if e is not None]
         dones = [e.done for e in experiences if e is not None]
 
+        states_per_agent = []
+        actions_per_agent = []
+        rewards_per_agent = []
+        next_states_per_agent = []
+        dones_per_agent = []
 
-        return (states, actions, rewards, next_states, dones)
+        for idx in range(num_agents):
+            states_per_agent.append(torch.from_numpy(np.vstack([state[idx] for state in states])).float().to(device))
+            actions_per_agent.append(torch.from_numpy(np.vstack([action[idx] for action in actions])).float().to(device))
+            rewards_per_agent.append(torch.from_numpy(np.vstack([reward[idx] for reward in rewards])).float().to(device))
+            next_states_per_agent.append(torch.from_numpy(np.vstack([next_state[idx] for next_state in next_states])).float().to(device))
+            dones_per_agent.append(torch.from_numpy(np.vstack([done[idx] for done in dones]).astype(np.uint8)).float().to(device))
+
+
+        return (states_per_agent, actions_per_agent, rewards_per_agent, next_states_per_agent, dones_per_agent)
 
     def __len__(self):
         return len(self.memory)
