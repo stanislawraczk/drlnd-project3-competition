@@ -1,6 +1,3 @@
-from collections import deque, namedtuple
-import random
-
 from torch.optim import Adam
 import torch
 import numpy as np
